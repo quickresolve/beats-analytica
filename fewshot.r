@@ -74,7 +74,7 @@ cat(sprintf("RF accuracy (full test set, n=%d): %.1f%%\n\n",
             nrow(test_data), rf_acc_full * 100))
 
 # ── 5. Few-shot prompt construction ──────────────────────────────────────────
-N_SHOT <- 3   # examples per genre
+N_SHOT <- 2   # examples per genre (3 → 2 reduces prompt size ~30%)
 
 # Compact single-line track representation
 fmt_track <- function(row) {
@@ -104,30 +104,103 @@ few_shot_block <- paste(few_shot_lines, collapse = "\n")
 
 # ── 6. Claude API helper ──────────────────────────────────────────────────────
 call_claude <- function(prompt,
-                        model      = "claude-opus-4-6",
-                        max_tokens = 256) {
+                        model       = "claude-opus-4-6",
+                        max_tokens  = 256,
+                        max_retries = 4) {
   api_key <- Sys.getenv("ANTHROPIC_API_KEY")
   if (!nzchar(api_key))
     stop("Set ANTHROPIC_API_KEY environment variable before running.")
 
-  resp <- request("https://api.anthropic.com/v1/messages") |>
-    req_headers(
-      "x-api-key"         = api_key,
-      "anthropic-version" = "2023-06-01",
-      "content-type"      = "application/json"
-    ) |>
-    req_body_json(list(
-      model      = model,
-      max_tokens = max_tokens,
-      messages   = list(list(role = "user", content = prompt))
-    )) |>
-    req_error(is_error = \(r) FALSE) |>
-    req_perform()
+  for (attempt in seq_len(max_retries)) {
+    resp <- request("https://api.anthropic.com/v1/messages") |>
+      req_headers(
+        "x-api-key"         = api_key,
+        "anthropic-version" = "2023-06-01",
+        "content-type"      = "application/json"
+      ) |>
+      req_body_json(list(
+        model      = model,
+        max_tokens = max_tokens,
+        messages   = list(list(role = "user", content = prompt))
+      )) |>
+      req_error(is_error = \(r) FALSE) |>
+      req_perform()
 
-  if (resp_status(resp) != 200)
-    stop(sprintf("API error %d: %s", resp_status(resp), resp_body_string(resp)))
+    status <- resp_status(resp)
 
-  resp_body_json(resp)$content[[1]]$text
+    if (status == 200)
+      return(resp_body_json(resp)$content[[1]]$text)
+
+    if (status == 429) {
+      # Honour the retry-after header when present; fall back to 60s
+      retry_after <- suppressWarnings(
+        as.numeric(resp_header(resp, "retry-after"))
+      )
+      wait <- if (!is.na(retry_after)) retry_after + 5 else 65
+      message(sprintf(
+        "  [429] Rate limited (attempt %d/%d) — waiting %ds",
+        attempt, max_retries, wait
+      ))
+      Sys.sleep(wait)
+      next
+    }
+
+    stop(sprintf("API error %d: %s", status, resp_body_string(resp)))
+  }
+
+  stop("call_claude: max retries exceeded after repeated 429 responses")
+}
+
+# ── 6b. Token-budget rate limiter ────────────────────────────────────────────
+# Anthropic enforces a per-minute input-token limit. This limiter tracks how
+# many tokens have been sent in a rolling 60-second window and sleeps just long
+# enough to bring usage back under TOKEN_BUDGET before the next request fires.
+
+TOKEN_BUDGET <- 20000   # conservative ceiling (actual limit 30 000)
+RL_WINDOW    <- 60      # rolling window in seconds
+.rl_log      <- list()  # internal state: list of list(ts, tokens)
+
+estimate_tokens <- function(text) {
+  # ~3.5 characters per token is a reasonable approximation for this prompt style
+  ceiling(nchar(text, type = "bytes") / 3.5)
+}
+
+throttle <- function(prompt_text) {
+  n_tok <- estimate_tokens(prompt_text)
+
+  # Loop until there is confirmed headroom — a single sleep may not be enough
+  # if several batches were sent close together.
+  repeat {
+    now     <- proc.time()[["elapsed"]]
+    .rl_log <<- Filter(function(e) (now - e$ts) < RL_WINDOW, .rl_log)
+    used    <- sum(vapply(.rl_log, `[[`, numeric(1), "tokens"))
+
+    if (used + n_tok <= TOKEN_BUDGET) break
+
+    # Sort entries oldest-first; find the minimum prefix whose expiry brings
+    # usage under budget, then sleep until that entry's window expires.
+    entries <- .rl_log[order(vapply(.rl_log, `[[`, numeric(1), "ts"))]
+    cum_freed  <- 0
+    target_ts  <- entries[[length(entries)]]$ts   # fallback: wait for all
+    for (e in entries) {
+      cum_freed <- cum_freed + e$tokens
+      if (used - cum_freed + n_tok <= TOKEN_BUDGET) {
+        target_ts <- e$ts
+        break
+      }
+    }
+
+    sleep_secs <- max(0, (target_ts + RL_WINDOW) - now) + 1   # +1s buffer
+    message(sprintf(
+      "  [rate limiter] used %d + %d > %d tok/min — sleeping %.1fs",
+      used, n_tok, TOKEN_BUDGET, sleep_secs
+    ))
+    Sys.sleep(sleep_secs)
+  }
+
+  .rl_log[[length(.rl_log) + 1]] <<- list(ts = proc.time()[["elapsed"]],
+                                           tokens = n_tok)
+  invisible(n_tok)
 }
 
 # ── 7. Batch LLM classifier ───────────────────────────────────────────────────
@@ -167,6 +240,7 @@ classify_batch <- function(rows, few_shot_block, genres) {
     paste(track_strs, collapse = "\n")
   )
 
+  throttle(prompt)
   raw <- call_claude(prompt, max_tokens = BATCH_SIZE * 12 + 50)
 
   # Parse: strip numbering, lowercase, map to known genre
@@ -218,7 +292,7 @@ for (b in seq_along(batches)) {
 
   cat(sprintf("  Batch %2d/%d done — genres: %s\n",
               b, length(batches), paste(preds, collapse = ", ")))
-  Sys.sleep(0.4)   # gentle rate limiting
+  Sys.sleep(1)     # minimum inter-call floor; throttle() adds more if needed
 }
 
 # ── 8. Results ────────────────────────────────────────────────────────────────

@@ -135,7 +135,7 @@ Raw CSVs
        └─ filter to genres ≥ 30 samples
             └─ stratified 80/20 train/test split
                  ├─ Random Forest  (trained on full training set)
-                 └─ Few-shot LLM   (3 examples/genre → API prompt)
+                 └─ Few-shot LLM   (2 examples/genre → API prompt)
                       └─ compare accuracy, per-genre breakdown, confusion matrix
 ```
 
@@ -152,7 +152,7 @@ audio features are most discriminative for genre classification.
 
 #### 2. LLM few-shot classification
 
-Three examples per genre are sampled from the training set and formatted as
+Two examples per genre are sampled from the training set and formatted as
 compact feature strings:
 
 ```
@@ -182,9 +182,9 @@ be matched are recorded as `NA` and excluded from accuracy calculations.
 ### Cost estimate
 
 With `MAX_TEST_N = 100` and `BATCH_SIZE = 5` (defaults), the script sends
-~20 API calls to `claude-opus-4-6`. Each prompt is approximately 10 000 input
+~20 API calls to `claude-opus-4-6`. Each prompt is approximately 7 000 input
 tokens (few-shot examples × genres) and requests at most 256 output tokens.
-Estimated cost: **< $1 USD** per full run at April 2026 pricing.
+Estimated cost: **< $1 USD** per full run at May 2026 pricing.
 
 Raise `MAX_TEST_N` to `NULL` to evaluate the full test set.
 
@@ -297,10 +297,13 @@ the usable data.
 
 ### fewshot.r
 
-**Few-shot count (N_SHOT = 3)**
-Three examples per genre keeps the prompt under ~10 000 tokens for even the
-largest genre sets. Increasing to 5–10 examples would likely improve LLM
-accuracy but roughly double input token cost per call.
+**Few-shot count (N_SHOT = 2)**
+Two examples per genre keeps each prompt under ~7 000 tokens, which provides
+meaningful headroom below the per-minute token rate limit. The original value
+of 3 was reduced after hitting the 30 000 token/minute org limit in practice;
+2 examples still gives the model a clear signal per genre while reducing
+prompt size by ~30%. Increasing to 5–10 examples would likely improve LLM
+accuracy but further tightens the rate-limit budget.
 
 **Batch size (BATCH_SIZE = 5)**
 Batching multiple tracks into one API call amortises the few-shot prefix cost.
@@ -323,6 +326,34 @@ hyphens (e.g. `hip-hop`) are the most common mismatch.
 Opus 4.6 is used to maximise classification quality. Switching to
 `claude-haiku-4-5` would cut API cost by ~5× at the expense of likely lower
 accuracy — a useful ablation to run if cost is a constraint.
+
+**Rate limiting (`throttle` + `call_claude` retry)**
+The Anthropic API enforces a 30 000 input-token-per-minute limit at the org
+level. Running 20 batches with a 0.4-second fixed delay was enough to exhaust
+this budget in under 10 seconds. Two complementary mechanisms now prevent this:
+
+*Rolling-window token budget (`throttle`)*
+Before every API call, `throttle` estimates the prompt size (~3.5 characters
+per token) and sums the tokens logged in the previous 60 seconds. If adding
+the new prompt would exceed `TOKEN_BUDGET` (20 000 — a 10 000-token margin
+below the hard limit), it calculates which logged entries need to expire to
+create enough headroom, then sleeps until that point plus a 1-second buffer.
+Critically, this runs in a `repeat` loop: after each sleep it re-checks from
+scratch, so a single expiry that still leaves insufficient headroom causes
+another targeted sleep rather than firing the request early. The loop only
+exits once the budget check genuinely passes.
+
+The 20 000-token budget (rather than, say, 28 000) exists because the
+`nchar / 3.5` heuristic can undercount tokens containing multi-byte characters
+or unusual formatting. The extra margin absorbs that estimation error.
+
+*429 retry with server-specified backoff (`call_claude`)*
+If a 429 slips through despite the proactive limiter (e.g. another process on
+the same org key is consuming tokens), `call_claude` reads the `retry-after`
+response header for the server-mandated wait, adds 5 seconds, and retries up
+to 4 times before raising an error. Previously, any 429 immediately produced
+`NA` for the entire batch; now it recovers silently. The console prints a
+message for each retry so progress is still visible.
 
 ---
 
